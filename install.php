@@ -80,17 +80,25 @@ function load_bundle_sql(string $baseDir, string $url, array &$log): ?string
 }
 
 // ── MSSQL 배치 실행 (GO 구분자 분리) ──────────────────────────────────────────
+// 한 배치가 실패해도(환경별 외부참조 객체 등) 설치를 중단하지 않고 건너뛰며 계속 진행.
 function exec_mssql_batches(PDO $pdo, string $sql): array
 {
     $batches = preg_split('/^\s*GO\s*;?\s*$/mi', $sql);
-    $ok = 0;
+    $ok = 0; $fail = 0; $warnings = [];
     foreach ($batches as $b) {
         $b = trim($b);
-        if ($b === '') continue;
-        $pdo->exec($b);
-        $ok++;
+        if ($b === '' || strtoupper($b) === 'GO') continue;
+        try {
+            $pdo->exec($b);
+            $ok++;
+        } catch (PDOException $e) {
+            $fail++;
+            if (count($warnings) < 10) {
+                $warnings[] = substr(preg_replace('/\s+/', ' ', $e->getMessage()), 0, 140);
+            }
+        }
     }
-    return ['batches' => $ok];
+    return ['batches' => $ok, 'failed' => $fail, 'warnings' => $warnings];
 }
 
 // ── STEP 2: 연결 테스트 → DB 생성 → 초기데이터 적재 → .env 작성 ───────────────
@@ -150,11 +158,14 @@ if ($step === 2 && $_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($bundle === null || $bundle === '') {
             $errors[] = '초기 데이터(speedmis_db)를 불러오지 못했습니다. 인터넷 연결 또는 db/speedmis_db.sql 파일을 확인하세요.';
         } else {
-            try {
-                $res = exec_mssql_batches($pdo, $bundle);
-                $log[] = "초기 데이터 적재 완료 ({$res['batches']} 배치)";
-            } catch (PDOException $e) {
-                $errors[] = '초기 데이터 적재 실패: ' . $e->getMessage();
+            $res = exec_mssql_batches($pdo, $bundle);
+            if ($res['batches'] < 20) {
+                $errors[] = '초기 데이터 적재가 거의 실패했습니다 (' . $res['batches'] . ' 배치). DB 권한/연결을 확인하세요.';
+                foreach ($res['warnings'] as $wmsg) $errors[] = '· ' . $wmsg;
+            } else {
+                $log[] = "초기 데이터 적재 완료 ({$res['batches']} 배치"
+                       . ($res['failed'] ? ", 환경별 객체 {$res['failed']}건 건너뜀" : "") . ")";
+                foreach ($res['warnings'] as $wmsg) $log[] = "  · 건너뜀: " . $wmsg;
             }
         }
     }
